@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
+import torch
 from ultralytics import YOLO
 
 
@@ -57,6 +58,19 @@ class DetectionResult:
 # def extract_highlight_clips(input_path, output_dir, slip_events, padding_sec=2):
 #     """Cut short clips around each slip event for quick review."""
 #     pass
+
+
+# ---------------------------------------------------------------------------
+# Device auto-detection: CUDA → MPS (Apple Silicon) → CPU
+# ---------------------------------------------------------------------------
+
+def _select_device() -> str:
+    """Pick the best available compute device for inference."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +266,10 @@ def run_detection(
     result.total_frames = total_frames
 
     # YOLOv8 nano pose model — auto-downloads on first run (~6 MB)
+    device = _select_device()
+    print(f"  Using device: {device}")
     model = YOLO("yolov8n-pose.pt")
+    model.to(device)
 
     # Per-player state keyed by YOLO track ID
     players: dict[int, _PlayerTracker] = defaultdict(
