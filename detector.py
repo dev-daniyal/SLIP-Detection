@@ -196,11 +196,13 @@ def run_detection(
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     result.total_frames = total_frames
 
-    # MediaPipe Pose — single-person model applied per detection window
-    # MediaPipe's base Pose solution processes one person at a time, but by
-    # scanning the full frame it will lock onto the most prominent pose.
-    # For multi-person coverage we rely on frequent sampling and the fact that
-    # slips are visually dominant events that MediaPipe tends to pick up.
+    # TODO: MediaPipe Pose tracks only ONE person at a time. For true multi-player
+    # coverage (10-14 players), consider switching to MediaPipe Holistic, using
+    # a person detector (e.g. YOLOv8) to crop individual players before pose
+    # estimation, or migrating to MMPose / ViTPose with multi-person support.
+    # Current approach relies on frequent sampling and the visual dominance of
+    # falls to catch slips, but will miss simultaneous falls and may bias toward
+    # the most prominent/central player.
     pose = mp.solutions.pose.Pose(
         static_image_mode=False,
         model_complexity=2,        # full / heavy model
@@ -214,19 +216,42 @@ def run_detection(
     prev_gray = None
     last_log_sec = -1  # for console progress logging
 
+    consecutive_failures = 0
+    max_consecutive_failures = 30  # ~1 second of footage at 30fps
+
     while True:
         if cancel_check and cancel_check():
             result.warnings.append("Processing cancelled by user.")
             break
 
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        # Skip frames for performance
+        # For skipped frames, use grab() which advances the codec without
+        # decoding the frame — significantly faster on long videos.
         if frame_idx % frame_skip != 0:
+            if not cap.grab():
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive_failures:
+                    break  # likely EOF
+                frame_idx += 1
+                continue
+            consecutive_failures = 0
             frame_idx += 1
             continue
+
+        ret, frame = cap.read()
+        if not ret:
+            # TODO: cap.read() returns False for both EOF and mid-stream
+            # corruption. We tolerate a run of failures before stopping so
+            # a few corrupt frames don't end processing prematurely.
+            consecutive_failures += 1
+            if consecutive_failures >= max_consecutive_failures:
+                if frame_idx < total_frames - max_consecutive_failures:
+                    result.warnings.append(
+                        f"Video read failed at frame {frame_idx} "
+                        f"(expected {total_frames}), possible corruption.")
+                break
+            frame_idx += 1
+            continue
+        consecutive_failures = 0
 
         timestamp = frame_idx / fps
         curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -255,7 +280,6 @@ def run_detection(
                       f"conf={event.confidence:.3f}")
         else:
             # Pose confidence too low to detect anyone
-            vis_key = "low"
             if int(timestamp) % 60 == 0 and int(timestamp) != last_log_sec:
                 result.warnings.append(
                     f"No pose detected at t={timestamp:.1f}s (may be transitional)")
@@ -298,6 +322,9 @@ def save_csv(result: DetectionResult, output_dir: str = "output") -> str:
 
     Returns the path to the written CSV.
     """
+    # TODO: output_dir is relative to CWD, not the script's directory.
+    # If the user launches from a different working directory, the CSV
+    # will be written there. Consider using Path(__file__).parent / output_dir.
     os.makedirs(output_dir, exist_ok=True)
     csv_path = os.path.join(output_dir, "slip_events.csv")
 

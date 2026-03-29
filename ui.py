@@ -124,23 +124,36 @@ class SlipDetectorApp:
         def cancel_cb():
             return self._cancel
 
-        result = run_detection(
-            self.video_path,
-            progress_callback=progress_cb,
-            cancel_check=cancel_cb,
-        )
+        try:
+            result = run_detection(
+                self.video_path,
+                progress_callback=progress_cb,
+                cancel_check=cancel_cb,
+            )
 
-        self.result = result
-        csv_path = save_csv(result)
-        self.csv_path = csv_path
+            self.result = result
+            csv_path = save_csv(result)
+            self.csv_path = csv_path
 
-        # Update UI on the main thread
-        self.root.after(0, self._on_complete)
+            # Update UI on the main thread
+            self.root.after(0, self._on_complete)
+        except Exception as e:
+            self._error_msg = str(e)
+            self.root.after(0, self._on_error)
 
     def _update_progress(self, pct, current, total):
         self.progress["value"] = pct
         self.status_label.config(
             text=f"Frame {current:,} / {total:,}  ({pct:.0f}%)")
+
+    def _on_error(self):
+        """Handle an exception from the background detection thread."""
+        self.run_btn.config(state="normal")
+        self.pick_btn.config(state="normal")
+        self.cancel_btn.config(state="disabled")
+        self.progress["value"] = 0
+        self.status_label.config(text="Error during processing.")
+        self.result_label.config(text=f"Error: {self._error_msg}")
 
     def _on_complete(self):
         self.run_btn.config(state="normal")
