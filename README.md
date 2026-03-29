@@ -33,11 +33,12 @@ Results are saved to `output/slip_events.csv` with columns:
 
 ## How It Works
 
-- **MediaPipe Pose** (full model, complexity 2) estimates body landmarks per frame
-- A vertical-collapse heuristic flags when a player's upper body drops to ground level
+- **YOLOv8 Pose** (`yolov8n-pose.pt`) detects and tracks ALL players simultaneously with per-person bounding boxes and 17 COCO keypoints
+- Built-in BoTSORT tracker maintains consistent player IDs across frames
+- Per-player **temporal slip detection**: monitors the vertical compression of shoulder/hip/ankle keypoints over a ~0.75s window; a rapid collapse flags a fall
 - **Optical flow stabilisation** compensates for minor drone drift
-- Every 3rd frame is sampled to keep processing time reasonable on ~1 hour footage
-- A 2-second cooldown between events prevents duplicate detections of the same fall
+- Every 3rd frame is sampled (skipped frames use `grab()` for speed)
+- Per-player 2-second cooldown prevents duplicate detections of the same fall
 
 ## Configuration
 

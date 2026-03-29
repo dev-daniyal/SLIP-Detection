@@ -1,19 +1,26 @@
 """
-Slip detection logic using MediaPipe Pose estimation.
+Slip detection using YOLOv8 multi-person pose estimation.
 
-Analyzes video frames to detect when players fall to the ground by tracking
-vertical collapse of pose landmarks (shoulders/hips dropping to knee/ankle level).
+Detects all players in each frame simultaneously using the YOLOv8-pose model
+with built-in tracking (BoTSORT). For each tracked player, monitors the
+vertical compression of body keypoints over time. A rapid collapse within
+~0.75 seconds flags a slip event.
 """
 
 import csv
 import os
 import time
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
 import cv2
-import mediapipe as mp
 import numpy as np
+from ultralytics import YOLO
 
+
+# ---------------------------------------------------------------------------
+# Data classes — public API consumed by ui.py
+# ---------------------------------------------------------------------------
 
 @dataclass
 class SlipEvent:
@@ -51,116 +58,164 @@ class DetectionResult:
 #     """Cut short clips around each slip event for quick review."""
 #     pass
 
+
 # ---------------------------------------------------------------------------
-# Core detection
+# COCO 17-keypoint indices (used by YOLOv8-pose)
 # ---------------------------------------------------------------------------
 
-# Landmark indices used for vertical-ratio slip heuristic
-_SHOULDER_L = mp.solutions.pose.PoseLandmark.LEFT_SHOULDER.value
-_SHOULDER_R = mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER.value
-_HIP_L = mp.solutions.pose.PoseLandmark.LEFT_HIP.value
-_HIP_R = mp.solutions.pose.PoseLandmark.RIGHT_HIP.value
-_KNEE_L = mp.solutions.pose.PoseLandmark.LEFT_KNEE.value
-_KNEE_R = mp.solutions.pose.PoseLandmark.RIGHT_KNEE.value
-_ANKLE_L = mp.solutions.pose.PoseLandmark.LEFT_ANKLE.value
-_ANKLE_R = mp.solutions.pose.PoseLandmark.RIGHT_ANKLE.value
+_L_SHOULDER, _R_SHOULDER = 5, 6
+_L_HIP, _R_HIP = 11, 12
+_L_KNEE, _R_KNEE = 13, 14
+_L_ANKLE, _R_ANKLE = 15, 16
+
+# Keypoints we rely on for the slip heuristic
+_KEY_JOINTS = [_L_SHOULDER, _R_SHOULDER, _L_HIP, _R_HIP, _L_ANKLE, _R_ANKLE]
 
 
-def _mean_y(landmarks, indices):
-    """Return the mean normalised y-coordinate for the given landmark indices."""
-    return np.mean([landmarks[i].y for i in indices])
+# ---------------------------------------------------------------------------
+# Per-player tracking state
+# ---------------------------------------------------------------------------
 
-
-def _mean_visibility(landmarks, indices):
-    """Return the mean visibility score for the given landmark indices."""
-    return np.mean([landmarks[i].visibility for i in indices])
-
-
-def _is_slip(landmarks, confidence_threshold: float = 0.65) -> tuple[bool, float]:
+class _PlayerTracker:
     """
-    Determine whether the pose represents a slip/fall.
+    Maintains recent pose history for a single tracked player.
 
-    A player is considered fallen when the vertical distance between their
-    upper body (shoulders) and lower body (ankles) is very small — i.e. the
-    torso has collapsed to near ground level.
-
-    Returns (is_slip, confidence).
+    Stores the "height ratio" — the vertical spread of body keypoints
+    normalised by bounding-box height.  A standing player has a high ratio
+    (~0.4–0.7); a fallen player approaches 0.
     """
-    key_indices = [_SHOULDER_L, _SHOULDER_R, _HIP_L, _HIP_R,
-                   _KNEE_L, _KNEE_R, _ANKLE_L, _ANKLE_R]
-    avg_vis = _mean_visibility(landmarks, key_indices)
 
-    # If pose confidence is too low, we can't make a reliable call
-    if avg_vis < 0.4:
-        return False, avg_vis
+    def __init__(self, max_history: int = 20):
+        # Each entry: (timestamp, height_ratio, avg_keypoint_confidence)
+        self.history: deque[tuple[float, float, float]] = deque(maxlen=max_history)
+        self.last_slip_time: float = -999.0
+        self.last_seen: float = 0.0       # for stale-tracker cleanup
 
-    shoulder_y = _mean_y(landmarks, [_SHOULDER_L, _SHOULDER_R])
-    hip_y = _mean_y(landmarks, [_HIP_L, _HIP_R])
-    ankle_y = _mean_y(landmarks, [_ANKLE_L, _ANKLE_R])
+    def record(self, timestamp: float, height_ratio: float, kp_conf: float):
+        self.history.append((timestamp, height_ratio, kp_conf))
+        self.last_seen = timestamp
 
-    # In normalised coords, y increases downward. When standing, shoulders are
-    # well above ankles (shoulder_y << ankle_y). When fallen, shoulders drop
-    # close to ankle level.
-    total_height = abs(ankle_y - shoulder_y)
+    def check_slip(
+        self,
+        confidence_threshold: float,
+        cooldown_sec: float,
+        look_back_sec: float = 0.75,
+    ) -> tuple[bool, float]:
+        """
+        Check whether this player just slipped.
 
-    # Very small vertical span → person is horizontal / on the ground
-    if total_height < 0.01:
-        return False, avg_vis  # degenerate, skip
+        Compares the current height_ratio against the recent maximum.  A large
+        rapid drop (standing → collapsed within *look_back_sec*) is flagged.
+        """
+        if len(self.history) < 3:
+            return False, 0.0
 
-    # Ratio of upper-body drop: how close hips are to ankles relative to total height
-    # When standing this is ~0.4-0.5; when fallen it approaches 0.0-0.15
-    torso_ratio = abs(ankle_y - hip_y) / total_height
+        curr_ts, curr_ratio, curr_conf = self.history[-1]
 
-    # Confidence that this is a slip: low torso_ratio + low total_height
-    # Combined heuristic score
-    height_score = max(0.0, 1.0 - (total_height / 0.35))  # 0.35 is typical standing span
-    ratio_score = max(0.0, 1.0 - (torso_ratio / 0.45))
+        # Per-player cooldown — avoid re-flagging the same fall
+        if curr_ts - self.last_slip_time < cooldown_sec:
+            return False, 0.0
 
-    confidence = 0.5 * height_score + 0.5 * ratio_score
-    # Weight by visibility so low-quality detections score lower
-    confidence *= min(avg_vis / 0.7, 1.0)
+        # Find the max height_ratio in the look-back window
+        max_standing_ratio = 0.0
+        for ts, ratio, conf in self.history:
+            if curr_ts - ts <= look_back_sec and conf > 0.3:
+                max_standing_ratio = max(max_standing_ratio, ratio)
 
-    return confidence >= confidence_threshold, confidence
+        # Need evidence of a clear standing pose recently
+        if max_standing_ratio < 0.25:
+            return False, 0.0
 
+        # Current pose must look collapsed
+        if curr_ratio > 0.18:
+            return False, 0.0
+
+        # Confidence = magnitude of collapse, weighted by keypoint quality
+        drop = (max_standing_ratio - curr_ratio) / max_standing_ratio
+        confidence = drop * min(curr_conf / 0.5, 1.0)
+
+        if confidence >= confidence_threshold:
+            self.last_slip_time = curr_ts
+            return True, round(confidence, 4)
+
+        return False, 0.0
+
+
+# ---------------------------------------------------------------------------
+# Pose metric extraction
+# ---------------------------------------------------------------------------
+
+def _compute_height_ratio(kp_xy, kp_conf, bbox):
+    """
+    Compute the vertical compression ratio for one detected person.
+
+    Returns (height_ratio, avg_keypoint_confidence) or (None, conf) when
+    keypoint quality is too low to make a reliable measurement.
+    """
+    x1, y1, x2, y2 = bbox
+    bbox_h = y2 - y1
+
+    if bbox_h < 10:
+        return None, 0.0
+
+    # Filter to key joints with sufficient confidence
+    confs = kp_conf[_KEY_JOINTS]
+    avg_conf = float(np.mean(confs))
+    visible = confs > 0.3
+
+    if visible.sum() < 4:
+        return None, avg_conf
+
+    # Vertical span of visible key joints
+    y_coords = kp_xy[_KEY_JOINTS, 1][visible]
+    vertical_span = float(np.max(y_coords) - np.min(y_coords))
+
+    height_ratio = vertical_span / bbox_h
+    return height_ratio, avg_conf
+
+
+# ---------------------------------------------------------------------------
+# Camera drift compensation
+# ---------------------------------------------------------------------------
 
 def _stabilise_frame(prev_gray, curr_gray, frame):
     """
     Compensate for minor camera drift between consecutive frames using
-    optical-flow-based alignment. Returns the stabilised frame.
+    optical-flow-based alignment.  Returns (stabilised_frame, gray_for_next).
     """
     if prev_gray is None:
         return frame, curr_gray
 
-    # Find feature points in the previous frame
-    features = cv2.goodFeaturesToTrack(prev_gray, maxCorners=200, qualityLevel=0.01,
-                                       minDistance=30, blockSize=3)
+    features = cv2.goodFeaturesToTrack(
+        prev_gray, maxCorners=200, qualityLevel=0.01, minDistance=30, blockSize=3,
+    )
     if features is None or len(features) < 10:
         return frame, curr_gray
 
-    # Calculate optical flow
     matched, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, features, None)
     if matched is None:
         return frame, curr_gray
 
-    # Filter valid matches
     good_old = features[status.flatten() == 1]
     good_new = matched[status.flatten() == 1]
 
     if len(good_old) < 6:
         return frame, curr_gray
 
-    # Estimate rigid transform (translation + rotation only)
     transform, _ = cv2.estimateAffinePartial2D(good_old, good_new)
     if transform is None:
         return frame, curr_gray
 
     h, w = frame.shape[:2]
-    # Invert the motion to stabilise
     inv = cv2.invertAffineTransform(transform)
     stabilised = cv2.warpAffine(frame, inv, (w, h))
     stabilised_gray = cv2.cvtColor(stabilised, cv2.COLOR_BGR2GRAY)
     return stabilised, stabilised_gray
 
+
+# ---------------------------------------------------------------------------
+# Core detection loop
+# ---------------------------------------------------------------------------
 
 def run_detection(
     video_path: str,
@@ -171,15 +226,15 @@ def run_detection(
     cancel_check=None,
 ) -> DetectionResult:
     """
-    Process a video file and detect slip events.
+    Process a video file and detect slip events using YOLOv8 pose estimation.
 
     Args:
         video_path: Path to MP4/MOV file.
         confidence_threshold: Minimum confidence to flag a slip (0.65–0.70).
         frame_skip: Process every Nth frame (default 3).
-        cooldown_sec: Minimum seconds between reported slips to avoid duplicates.
-        progress_callback: Optional callable(current_frame, total_frames) for UI updates.
-        cancel_check: Optional callable() that returns True to abort processing.
+        cooldown_sec: Per-player cooldown between reported slips.
+        progress_callback: Optional callable(current_frame, total_frames).
+        cancel_check: Optional callable() returning True to abort.
 
     Returns:
         DetectionResult with slip events and metadata.
@@ -196,41 +251,31 @@ def run_detection(
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     result.total_frames = total_frames
 
-    # TODO: MediaPipe Pose tracks only ONE person at a time. For true multi-player
-    # coverage (10-14 players), consider switching to MediaPipe Holistic, using
-    # a person detector (e.g. YOLOv8) to crop individual players before pose
-    # estimation, or migrating to MMPose / ViTPose with multi-person support.
-    # Current approach relies on frequent sampling and the visual dominance of
-    # falls to catch slips, but will miss simultaneous falls and may bias toward
-    # the most prominent/central player.
-    pose = mp.solutions.pose.Pose(
-        static_image_mode=False,
-        model_complexity=2,        # full / heavy model
-        smooth_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
+    # YOLOv8 nano pose model — auto-downloads on first run (~6 MB)
+    model = YOLO("yolov8n-pose.pt")
+
+    # Per-player state keyed by YOLO track ID
+    players: dict[int, _PlayerTracker] = defaultdict(
+        lambda: _PlayerTracker(max_history=20)
     )
 
     frame_idx = 0
-    last_slip_time = -999.0  # timestamp of last recorded slip
     prev_gray = None
-    last_log_sec = -1  # for console progress logging
-
+    last_log_sec = -1
     consecutive_failures = 0
-    max_consecutive_failures = 30  # ~1 second of footage at 30fps
+    max_consecutive_failures = 30  # ~1 second at 30 fps
 
     while True:
         if cancel_check and cancel_check():
             result.warnings.append("Processing cancelled by user.")
             break
 
-        # For skipped frames, use grab() which advances the codec without
-        # decoding the frame — significantly faster on long videos.
+        # For skipped frames, use grab() — advances the codec without decoding.
         if frame_idx % frame_skip != 0:
             if not cap.grab():
                 consecutive_failures += 1
                 if consecutive_failures >= max_consecutive_failures:
-                    break  # likely EOF
+                    break
                 frame_idx += 1
                 continue
             consecutive_failures = 0
@@ -239,9 +284,8 @@ def run_detection(
 
         ret, frame = cap.read()
         if not ret:
-            # TODO: cap.read() returns False for both EOF and mid-stream
-            # corruption. We tolerate a run of failures before stopping so
-            # a few corrupt frames don't end processing prematurely.
+            # Tolerate a run of failures before stopping so a few corrupt
+            # frames don't end processing prematurely.
             consecutive_failures += 1
             if consecutive_failures >= max_consecutive_failures:
                 if frame_idx < total_frames - max_consecutive_failures:
@@ -260,37 +304,71 @@ def run_detection(
         stabilised, curr_gray_out = _stabilise_frame(prev_gray, curr_gray, frame)
         prev_gray = curr_gray_out
 
-        # Run pose estimation
-        rgb = cv2.cvtColor(stabilised, cv2.COLOR_BGR2RGB)
-        results = pose.process(rgb)
+        # --- YOLOv8 multi-person pose tracking ---
+        yolo_results = model.track(
+            stabilised,
+            persist=True,       # maintain track IDs across frames
+            conf=0.3,           # detection confidence floor
+            iou=0.5,
+            verbose=False,
+        )
 
-        if results.pose_landmarks:
-            landmarks = results.pose_landmarks.landmark
-            slip_detected, confidence = _is_slip(landmarks, confidence_threshold)
+        detections = yolo_results[0]
 
-            if slip_detected and (timestamp - last_slip_time) >= cooldown_sec:
-                event = SlipEvent(
-                    timestamp=round(timestamp, 2),
-                    frame_number=frame_idx,
-                    confidence=round(confidence, 4),
+        # track() returns None for boxes.id when no objects are tracked
+        if detections.boxes.id is not None and detections.keypoints is not None:
+            track_ids = detections.boxes.id.cpu().numpy().astype(int)
+            boxes = detections.boxes.xyxy.cpu().numpy()        # (N, 4)
+            kp_xy = detections.keypoints.xy.cpu().numpy()      # (N, 17, 2)
+            kp_conf = detections.keypoints.conf.cpu().numpy()  # (N, 17)
+
+            for i, track_id in enumerate(track_ids):
+                height_ratio, avg_conf = _compute_height_ratio(
+                    kp_xy[i], kp_conf[i], boxes[i],
                 )
-                result.slips.append(event)
-                last_slip_time = timestamp
-                print(f"  [SLIP] t={event.timestamp:.1f}s  frame={event.frame_number}  "
-                      f"conf={event.confidence:.3f}")
-        else:
-            # Pose confidence too low to detect anyone
-            if int(timestamp) % 60 == 0 and int(timestamp) != last_log_sec:
-                result.warnings.append(
-                    f"No pose detected at t={timestamp:.1f}s (may be transitional)")
+
+                if height_ratio is None:
+                    # Keypoints too unreliable for this person — skip
+                    continue
+
+                tracker = players[track_id]
+                tracker.record(timestamp, height_ratio, avg_conf)
+
+                slip, confidence = tracker.check_slip(
+                    confidence_threshold, cooldown_sec,
+                )
+                if slip:
+                    event = SlipEvent(
+                        timestamp=round(timestamp, 2),
+                        frame_number=frame_idx,
+                        confidence=confidence,
+                    )
+                    result.slips.append(event)
+                    print(
+                        f"  [SLIP] t={event.timestamp:.1f}s  "
+                        f"frame={event.frame_number}  "
+                        f"player={track_id}  "
+                        f"conf={event.confidence:.3f}"
+                    )
+
+        # Periodically prune stale trackers to bound memory
+        if frame_idx % (frame_skip * 300) == 0:
+            stale_ids = [
+                tid for tid, trk in players.items()
+                if timestamp - trk.last_seen > 10.0
+            ]
+            for tid in stale_ids:
+                del players[tid]
 
         # Console progress every ~60 seconds of footage
-        current_minute = int(timestamp // 60)
-        if current_minute > 0 and int(timestamp) % 60 == 0 and int(timestamp) != last_log_sec:
+        if int(timestamp) % 60 == 0 and int(timestamp) > 0 and int(timestamp) != last_log_sec:
             last_log_sec = int(timestamp)
             elapsed = time.time() - start_time
-            print(f"  Progress: {timestamp/60:.0f} min of footage processed "
-                  f"({elapsed:.0f}s elapsed, {len(result.slips)} slips so far)")
+            print(
+                f"  Progress: {timestamp / 60:.0f} min of footage processed "
+                f"({elapsed:.0f}s elapsed, {len(result.slips)} slips so far, "
+                f"{len(players)} active tracks)"
+            )
 
         # UI progress callback
         if progress_callback:
@@ -298,23 +376,29 @@ def run_detection(
 
         frame_idx += 1
 
-    pose.close()
     cap.release()
 
     result.processing_time = round(time.time() - start_time, 2)
 
-    # Final summary to console
-    avg_conf = (np.mean([s.confidence for s in result.slips])
-                if result.slips else 0.0)
-    print(f"\n{'='*50}")
+    # Final console summary
+    avg_conf = (
+        float(np.mean([s.confidence for s in result.slips]))
+        if result.slips
+        else 0.0
+    )
+    print(f"\n{'=' * 50}")
     print(f"  Detection complete.")
     print(f"  Total slips: {len(result.slips)}")
     print(f"  Processing time: {result.processing_time:.1f}s")
     print(f"  Average confidence: {avg_conf:.3f}")
-    print(f"{'='*50}\n")
+    print(f"{'=' * 50}\n")
 
     return result
 
+
+# ---------------------------------------------------------------------------
+# CSV export
+# ---------------------------------------------------------------------------
 
 def save_csv(result: DetectionResult, output_dir: str = "output") -> str:
     """
@@ -324,7 +408,7 @@ def save_csv(result: DetectionResult, output_dir: str = "output") -> str:
     """
     # TODO: output_dir is relative to CWD, not the script's directory.
     # If the user launches from a different working directory, the CSV
-    # will be written there. Consider using Path(__file__).parent / output_dir.
+    # will be written there.  Consider using Path(__file__).parent / output_dir.
     os.makedirs(output_dir, exist_ok=True)
     csv_path = os.path.join(output_dir, "slip_events.csv")
 
