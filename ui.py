@@ -33,8 +33,17 @@ class SlipDetectorApp:
         # macOS Tk rendering workaround: force the display pipeline to
         # flush before entering mainloop, otherwise widgets may never
         # paint on macOS Ventura/Sonoma/Sequoia with Homebrew python-tk.
+        #
+        # update_idletasks() alone only processes geometry/layout idle
+        # tasks — it does NOT flush the Quartz draw pipeline.  The
+        # withdraw → update_idletasks → deiconify sequence unmaps and
+        # remaps the window, forcing the compositor to issue a full
+        # repaint of every widget that was already packed.
         if platform.system() == "Darwin":
             self.root.update_idletasks()
+            self.root.withdraw()
+            self.root.update_idletasks()
+            self.root.deiconify()
 
     # ------------------------------------------------------------------
     # UI construction
