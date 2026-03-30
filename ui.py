@@ -192,4 +192,9 @@ class SlipDetectorApp:
 
     def run(self):
         """Start the Tkinter main loop."""
+        # Flush the idle-task queue so all widgets are painted before the
+        # event loop begins.  On macOS (Python 3.11 + Tk/Aqua) the initial
+        # draw events are queued as idle tasks; without this call they are
+        # never processed and the window renders completely blank.
+        self.root.update_idletasks()
         self.root.mainloop()
