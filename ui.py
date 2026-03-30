@@ -28,22 +28,21 @@ class SlipDetectorApp:
         self.csv_path: str | None = None
         self._cancel = False
 
+        # macOS Tk rendering workaround: hide the window before building
+        # the UI so Quartz never tries to paint incomplete widgets during
+        # construction.  After the layout is complete, deiconify() remaps
+        # the window and update() flushes the full Quartz draw pipeline
+        # (update_idletasks() only flushes geometry/layout — it skips
+        # expose/paint events).
+        if platform.system() == "Darwin":
+            self.root.withdraw()
+
         self._build_ui()
 
-        # macOS Tk rendering workaround: force the display pipeline to
-        # flush before entering mainloop, otherwise widgets may never
-        # paint on macOS Ventura/Sonoma/Sequoia with Homebrew python-tk.
-        #
-        # update_idletasks() alone only processes geometry/layout idle
-        # tasks — it does NOT flush the Quartz draw pipeline.  The
-        # withdraw → update_idletasks → deiconify sequence unmaps and
-        # remaps the window, forcing the compositor to issue a full
-        # repaint of every widget that was already packed.
         if platform.system() == "Darwin":
             self.root.update_idletasks()
-            self.root.withdraw()
-            self.root.update_idletasks()
             self.root.deiconify()
+            self.root.update()
 
     # ------------------------------------------------------------------
     # UI construction
