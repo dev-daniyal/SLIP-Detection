@@ -30,6 +30,12 @@ class SlipDetectorApp:
 
         self._build_ui()
 
+        # macOS Tk rendering workaround: force the display pipeline to
+        # flush before entering mainloop, otherwise widgets may never
+        # paint on macOS Ventura/Sonoma/Sequoia with Homebrew python-tk.
+        if platform.system() == "Darwin":
+            self.root.update_idletasks()
+
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
